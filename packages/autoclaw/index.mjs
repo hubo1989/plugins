@@ -29,7 +29,7 @@ const PRODUCT = "autoclaw";
 const CHANNEL = "AutoClaw4";
 const CLIENT_VERSION = "1.18.1";
 const PLATFORM_TM = process.platform === "darwin" ? "mac" : process.platform === "win32" ? "win" : "linux";
-const USER_AGENT = `AutoClaw/${CLIENT_VERSION} (${PLATFORM_TM}-arm64)`;
+const USER_AGENT = `AutoClaw/${CLIENT_VERSION} (${PLATFORM_TM}-${process.arch})`;
 
 const GLOBAL_HOST = "https://autoglm-api.autoglm.ai";
 const CN_HOST = "https://autoglm-api.zhipuai.cn";
@@ -39,6 +39,8 @@ const WALLETS_PATH = `/agent-assetmgr/api/v2/wallets?biz_app_id=${PRODUCT}`;
 
 const OAUTH_EXPIRY_SKEW_MS = 10 * 60 * 1000;
 const FALLBACK_EXPIRES_IN_S = 5 * 3600;
+/** 本地 OAuth 会话上限：callback 的等待是 5 分钟；宿主不调 callback 时兜底释放端口。 */
+const OAUTH_SESSION_TIMEOUT_MS = 10 * 60 * 1000;
 
 /** 模型清单：键 = magpie 里显示的 id；值里的 id = 上游接受的 routeModelId。 */
 function autoclawModels() {
@@ -480,7 +482,8 @@ function makeAutoclawPlugin({ providerId, providerName, homeHost, loginMethod })
           const signinWindow = signinFinal
             ? [{
                 name: "每日签到",
-                used: signinFinal.status === "completed" ? 0 : 1,
+                // used 是 0–100 的百分比；签到行只表达状态，状态在 display 里
+                used: 0,
                 display: signinFinal.status === "completed"
                   ? `今日已签 ✓${signinFinal.reward ? ` +${signinFinal.reward}` : ""}`
                   : `今日未签（+${signinFinal.reward || 400}）`,
@@ -626,12 +629,14 @@ const overseaOAuthMethod = {
  * url = 本地引导页（滑块在内完成，之后自动跳授权页）；callback 挂起等 code，
  * 拿到后直连上游换 token。
  */
-async function startLocalOAuth(vendor) {
+async function startLocalOAuth(vendor, openFn = openBrowser) {
   const deviceId = newDeviceId();
   const state = {
     captchaReceipt: null,
     oauthCode: null,
     oauthState: "",
+    // /open-auth 从上游授权页地址里读出的 state；回调必须原样带回（防 login CSRF）
+    expectedOauthState: null,
     error: null,
   };
   const waiters = [];
@@ -653,7 +658,8 @@ async function startLocalOAuth(vendor) {
   // 18432 被占（如官方客户端在跑）时依次尝试其余。
   const FIXED_PORTS = [18432, 19654, 19723, 53699];
 
-  // 先行探测可用端口（listen → 记下 → 关闭，真正 listen 在 callback 里）
+  // 探测可用端口（listen → 记下 → 关闭），随后本函数末尾立即 listen 占住，
+  // 直到 callback 完成或 OAUTH_SESSION_TIMEOUT_MS 超时（宿主可能不调 callback）。
   let fixedPort = 0;
   const probe = http.createServer();
   for (const p of FIXED_PORTS) {
@@ -742,18 +748,38 @@ async function startLocalOAuth(vendor) {
           send(200, "application/json", JSON.stringify({ error: "上游未返回授权页地址" }));
           return;
         }
+        // 记下上游放进授权页的 state：回调必须原样带回，否则拒收（防伪造回调劫持登录）
+        let handedOutState = "";
+        try { handedOutState = new URL(authorizeUrl).searchParams.get("state") ?? ""; } catch { /* 非法地址按缺 state 处理 */ }
+        if (!handedOutState) {
+          send(200, "application/json", JSON.stringify({ error: "上游授权页地址缺少 state 参数，已取消登录（回调校验必需）" }));
+          return;
+        }
+        state.expectedOauthState = handedOutState;
         send(200, "application/json", JSON.stringify({ url: authorizeUrl }));
       })().catch((e) => send(200, "application/json", JSON.stringify({ error: `获取授权页失败: ${e?.message ?? e}` })));
       return;
     }
 
-    // 官方注册的回调路径：/auth/callback-<vendor>（另有旧 /callback 兜底）
-    if (url.pathname === `/auth/callback-${vendor}` || url.pathname === "/callback") {
-      state.oauthCode = url.searchParams.get("code");
-      state.oauthState = url.searchParams.get("state") ?? "";
-      if (!state.oauthCode) state.error = "回调缺少 code 参数";
-      notify();
-      send(200, "text/html; charset=utf-8", callbackPageHtml(!!state.oauthCode));
+    // 官方注册的回调路径：/auth/callback-<vendor>（redirect_uri 传的就是它）。
+    // 等待窗口内任何网页都能导航到本端口——code 必须配上 /open-auth 记下的
+    // state 才收，否则只回失败页：把别人的 code 塞进来会登录成别人的账号。
+    if (url.pathname === `/auth/callback-${vendor}`) {
+      const code = url.searchParams.get("code");
+      const cbState = url.searchParams.get("state") ?? "";
+      const accepted = !!code && state.expectedOauthState !== null && cbState === state.expectedOauthState;
+      if (accepted) {
+        state.oauthCode = code;
+        state.oauthState = cbState;
+        notify();
+        send(200, "text/html; charset=utf-8", callbackPageHtml(true));
+      } else {
+        // 拒收但不动会话状态：之后到达的合法回调仍能完成登录
+        const note = !code ? undefined
+          : state.expectedOauthState === null ? "授权尚未发起或已结束，请回引导页重试。"
+          : "回调校验失败（state 不匹配），已拒绝——请回 magpie 重新登录。";
+        send(200, "text/html; charset=utf-8", callbackPageHtml(false, note));
+      }
       return;
     }
 
@@ -774,6 +800,24 @@ async function startLocalOAuth(vendor) {
     server.listen(fixedPort, "127.0.0.1", () => resolve(fixedPort));
   });
 
+  // 会话最长 OAUTH_SESSION_TIMEOUT_MS：宿主可能永远不调 callback（用户在 magpie
+  // 里取消），定时器负责关服务器、释放官方 TokenServer 端口。
+  let sessionDone = false;
+  let sessionClosed = false;
+  const closeServer = () => {
+    if (sessionClosed) return;
+    sessionClosed = true;
+    clearTimeout(sessionTimer);
+    if (!sessionDone) {
+      state.error ??= "本地登录已超时，服务器已关闭——请重新发起登录";
+      notify();
+    }
+    try { server.close(); } catch { /* 未 listening/已关闭 */ }
+    server.closeAllConnections?.();
+  };
+  const sessionTimer = setTimeout(closeServer, OAUTH_SESSION_TIMEOUT_MS);
+  sessionTimer.unref?.();
+
   return {
     url: "", // 由 callback 里自行开浏览器（本地引导页），宿主不重复打开
     instructions: `已打开本地引导页（未自动打开时手动访问 http://127.0.0.1:${fixedPort}/ ）：请完成滑块验证并登录授权，完成后自动返回 magpie。`,
@@ -783,7 +827,7 @@ async function startLocalOAuth(vendor) {
       const guide = `http://127.0.0.1:${port}/`;
       const redirectUri = `http://localhost:${port}/auth/callback-${vendor}`;
       try {
-        openBrowser(guide);
+        openFn(guide);
         const code = await waitFor(5 * 60 * 1000, "浏览器登录");
         const res = await callEnvelope(`/userapi/overseasv1/${vendor}-oauth-login`, {
           method: "POST",
@@ -805,7 +849,8 @@ async function startLocalOAuth(vendor) {
           uid: nonEmptyString(res.data.user_id) ?? undefined,
         };
       } finally {
-        server.close();
+        sessionDone = true;
+        closeServer();
       }
     },
   };
@@ -941,14 +986,14 @@ boot().catch((e)=>msg("初始化失败："+e.message,"err"));
 </script></body></html>`;
 }
 
-/** 授权回调落地页。 */
-function callbackPageHtml(ok) {
+/** 授权回调落地页；note 覆盖默认文案（如 state 校验被拒的原因）。 */
+function callbackPageHtml(ok, note) {
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>AutoClaw 登录</title>
 <style>body{font-family:-apple-system,"PingFang SC",sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background:#f5f6fa}
 .c{background:#fff;border-radius:16px;box-shadow:0 8px 30px rgba(0,0,0,.08);padding:40px 48px;text-align:center}
 h1{font-size:18px;margin:0 0 8px;color:${ok ? "#1a9c5b" : "#d43c3c"}}</style></head>
 <body><div class="c"><h1>${ok ? "✓ 授权成功" : "✗ 授权失败"}</h1>
-<p style="color:#666;font-size:14px">${ok ? "正在返回 magpie 完成登录，本页可以关闭。" : "回调缺少 code，请回 magpie 重试。"}</p></div></body></html>`;
+<p style="color:#666;font-size:14px">${note ?? (ok ? "正在返回 magpie 完成登录，本页可以关闭。" : "回调缺少 code，请回 magpie 重试。")}</p></div></body></html>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -975,6 +1020,6 @@ export const AutoclawCnAuthPlugin = makeAutoclawPlugin({
 export const _internal = {
   md5Hex, jwtClaim, tokenFields, codeValue, bizHeaders, bareToken, newDeviceId,
   dailySignin, signinStatus, maybeSignin, signinConfig, checkinOutcome, refreshTokens,
-  fetchUserProfile, accountDisplayName,
+  fetchUserProfile, accountDisplayName, startLocalOAuth,
   guidePageHtml, callbackPageHtml,
 };
