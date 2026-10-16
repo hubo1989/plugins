@@ -9,8 +9,11 @@
 // The account's fetch also sends Trae CN's own pages on api.trae.cn
 // (/trae/api/…) as the account, for magpie's daily check-in (每日签到:
 // /trae/api/v2/ug/checkin_credits/status, then /claim).
-import { generateKeyPairSync, randomBytes, randomUUID, randomInt, sign } from "node:crypto"
+import { createDecipheriv, createHash, generateKeyPairSync, randomBytes, randomUUID, randomInt, sign } from "node:crypto"
+import { readFile } from "node:fs/promises"
 import { createServer, STATUS_CODES } from "node:http"
+import { homedir, release, version as osVersion } from "node:os"
+import { join } from "node:path"
 
 const SITES = {
   // Trae CN (trae.cn): the authorization page sends the browser back to a
@@ -79,11 +82,19 @@ const SITES = {
     // the model host for an account: Trae CN's own hosts serve no models,
     // so only a host that is one is taken, else the one gateway
     apiOf: (a) => {
-      const h = String(a?.api ?? "").replace(/\/+$/, "")
-      return /mchost\.guru|trae-api-/i.test(h) ? h : SITES["trae-cn"].hosts.api
+      const h = traeHost(a?.api)
+      return h && SITES["trae-cn"].modelHost(h) ? h : SITES["trae-cn"].hosts.api
     },
-    // whether a host named by a sign-in is one of the model hosts
-    modelHost: (h) => /mchost\.guru|trae-api-/i.test(String(h ?? "")),
+    // whether a host named by a sign-in is one of the model hosts: an https
+    // host on mchost.guru or named trae-api-…, as the consumer gateway is,
+    // or another trae.cn host than the consumer site's own (www, api,
+    // grow…), which an enterprise (SaaS) sign-in may name for its tenant
+    modelHost: (h) => {
+      const t = traeHost(h)
+      if (!t) return false
+      const n = new URL(t).hostname
+      return /(^|\.)mchost\.guru$|^trae-api-/i.test(n) || (/\.trae\.cn$/i.test(n) && !/^(www|api|grow[^.]*)\./i.test(n))
+    },
     // ownPage: url is one of Trae CN's own JSON pages on api.trae.cn
     // (/trae/api/…: the daily check-in, credits), which the account's fetch
     // sends as the account rather than as a chat
@@ -166,15 +177,22 @@ const SITES = {
     // the model host: the account's region (or a US host the sign-in named)
     // selects the US deployment, else the SG one
     apiOf: (a) => {
-      const h = String(a?.api ?? "").replace(/\/+$/, "")
+      const h = traeHost(a?.api)
+      const n = h ? new URL(h).hostname : ""
       const region = String(a?.region ?? "").toUpperCase()
-      if (/coreva/i.test(h) || /api-us(?:[-.]|$)/i.test(h) || /^US(?:[-_ ]|$)/.test(region)) return SITES["trae-global"].hosts.us
-      if (/coresg/i.test(h)) return h
+      if (/coreva/i.test(n) || /api-us(?:[-.]|$)/i.test(n) || /^US(?:[-_ ]|$)/.test(region)) return SITES["trae-global"].hosts.us
+      if (/coresg/i.test(n)) return h
+      // another trae.ai host than the site's own (www, api-…, grow…): one an
+      // enterprise (SaaS) sign-in named for its tenant
+      if (/\.trae\.ai$/i.test(n) && !/^(www\.|api[-.]|grow)/i.test(n)) return h
       return SITES["trae-global"].hosts.api
     },
     // a sign-in names a host of Trae's, which can be an auth host
     // (api-us-east), not the chat host
-    modelHost: (h) => /trae\.ai/i.test(String(h ?? "")),
+    modelHost: (h) => {
+      const t = traeHost(h)
+      return !!t && /(^|\.)trae\.ai$/i.test(new URL(t).hostname)
+    },
     // Trae Global serves no own JSON pages through the account's fetch
     ownPage: () => false,
     // the account's region, from the sign-in's user info
@@ -211,6 +229,46 @@ const SITES = {
       },
     },
   },
+}
+
+// traeHost is a host a sign-in named, when it is a well-formed https one
+// on Trae's own domains (no port, no credentials), as origin plus any path;
+// "" for anything else, which is then not taken
+const TRAE_DOMAINS = ["trae.cn", "trae.ai", "mchost.guru"]
+function traeHost(h) {
+  try {
+    const u = new URL(String(h ?? "").trim())
+    if (u.protocol !== "https:" || u.username || u.password || u.port || u.search || u.hash) return ""
+    const n = u.hostname.toLowerCase()
+    if (!TRAE_DOMAINS.some((d) => n === d || n.endsWith("." + d))) return ""
+    return (u.origin + u.pathname).replace(/\/+$/, "")
+  } catch {
+    return ""
+  }
+}
+
+// authHostOf is the host a sign-in named for its tokens, when it named one
+// on the site's own domain (an enterprise's may differ from the consumer
+// one); "" when it named none, and the site's own is used
+function authHostOf(h, site) {
+  const t = traeHost(h)
+  if (!t) return ""
+  const n = new URL(t).hostname
+  return n === site.webHost || n.endsWith("." + site.webHost) ? t : ""
+}
+
+// accountOf keeps the account fields of the sign-in's user info that say
+// what kind of account it is (tenant, enterprise, login type), plain values
+// only and never anything that looks like a secret, for later use; nothing
+// sends them
+function accountOf(info) {
+  const out = {}
+  for (const [k, v] of Object.entries(info ?? {})) {
+    if (!/tenant|enterprise|saas|login|org|team|sso|^ent|usertype|accounttype/i.test(k)) continue
+    if (/token|secret|key|password|cookie|session|jwt/i.test(k)) continue
+    if (v === null || ["string", "number", "boolean"].includes(typeof v)) out[k] = v
+  }
+  return out
 }
 
 const SIGN_IN_TIMEOUT = 10 * 60 * 1000
@@ -301,6 +359,11 @@ function toAuth(s, site) {
     // the model host the sign-in named, if it named one
     ...(site.modelHost(s.api) ? { api: s.api } : {}),
     ...(s.region ? { region: s.region } : {}),
+    // the host the sign-in named, its own token host if it named one, and
+    // what kind of account it is (an enterprise one's tenant), kept as given
+    ...(traeHost(s.host) ? { host: traeHost(s.host) } : {}),
+    ...(authHostOf(s.authHost, site) ? { authHost: authHostOf(s.authHost, site) } : {}),
+    ...(s.account && Object.keys(s.account).length ? { account: s.account } : {}),
   }
 }
 
@@ -319,6 +382,9 @@ function fromAuth(auth, site) {
     devicePrivateKey: auth.devicePrivateKey || "",
     api: auth.api || "",
     region: site.regionOf(auth),
+    host: auth.host || "",
+    authHost: authHostOf(auth.authHost, site),
+    account: auth.account && typeof auth.account === "object" ? auth.account : {},
   }
 }
 
@@ -405,6 +471,7 @@ async function exchange(refresh, clientId, site, host = site.hosts.auth) {
       name: String(info.ScreenName ?? info.screenName ?? ""),
       api: info.Host ?? "",
       region: site.regionOf(info),
+      account: accountOf(info),
     }
   }
   const e = errorOf(text)
@@ -495,12 +562,14 @@ async function boundExchange(a, site, host = site.hosts.auth) {
 // before 0.2.3 (exchange). A device key made for the account goes with
 // either, so the next renewal signs with the same one.
 async function renewal(a, site) {
-  if (!site.deviceExchange) return exchange(a.refresh, a.clientId, site)
+  // the token host the sign-in named, else the site's
+  const host = authHostOf(a.authHost, site) || site.hosts.auth
+  if (!site.deviceExchange) return exchange(a.refresh, a.clientId, site, host)
   const keys = a.devicePrivateKey && a.devicePublicKey ? {} : newDeviceKey()
   try {
-    return await boundExchange({ ...a, ...keys }, site)
+    return await boundExchange({ ...a, ...keys }, site, host)
   } catch {}
-  return { ...(await exchange(a.refresh, a.clientId, site)), ...keys }
+  return { ...(await exchange(a.refresh, a.clientId, site, host)), ...keys }
 }
 
 // ---- the browser sign-in --------------------------------------------------------
@@ -527,10 +596,15 @@ async function signedIn(q, device, site) {
     name: String(info.ScreenName ?? info.screenName ?? ""),
     api: host,
     region: site.regionOf(info),
+    host,
+    // a token host the callback named, if it named one
+    authHost: authHostOf(q.get("authHost") || q.get("auth_host") || info.AuthHost || info.authHost, site),
+    account: accountOf(info),
   }
+  const authHost = s.authHost || site.hosts.auth
   if (!s.token && s.refresh) {
-    const x = await exchange(s.refresh, s.clientId, site)
-    s = { ...s, ...x, uid: x.uid || s.uid, name: x.name || s.name, api: x.api || s.api, region: x.region || s.region }
+    const x = await exchange(s.refresh, s.clientId, site, authHost)
+    s = { ...s, ...x, uid: x.uid || s.uid, name: x.name || s.name, api: x.api || s.api, region: x.region || s.region, host: s.host || x.api, account: { ...x.account, ...s.account } }
   }
   if (!s.token) throw new Error(`${site.webHost} sent back no token`)
   if (!s.refresh) throw new Error(`${site.webHost} sent back no refresh token`)
@@ -539,7 +613,7 @@ async function signedIn(q, device, site) {
   // one at once, so a check-in takes it; when Trae won't, it does as is
   if (site.deviceExchange) {
     try {
-      const x = await boundExchange(s, site)
+      const x = await boundExchange(s, site, authHost)
       s = { ...s, token: x.token, refresh: x.refresh, expires: x.expires || s.expires }
     } catch {}
   }
@@ -616,7 +690,9 @@ async function browserSignIn(site) {
     x_env: "",
     x_app_version: site.ideVersion,
     x_app_type: "stable",
-    hide_saas_login: "true",
+    // the enterprise (SaaS) sign-in is offered beside the personal one: an
+    // enterprise subscription signs in there (@shad70w0 on X)
+    hide_saas_login: "false",
   })
   return {
     url: `${site.hosts.web}/authorization?${q}`,
@@ -666,9 +742,12 @@ const ugUA = (site) =>
 // ugHeaders are the headers Trae CN's IDE (3.3.104) sends a growth page
 // with, and only those: its JWT, then its device (fb: x-device-id,
 // x-device-brand, x-device-type, x-os-version, x-app-version), not the
-// chat's tokens and versions.
-function ugHeaders(a, site, extra = {}) {
-  return {
+// chat's tokens and versions. own is this machine's Trae CN client, when
+// it is signed in as this very account (ownClient): its device id and
+// this machine's OS go instead of the account's, and no brand is named
+// (fb leaves it out when it has no model to name).
+function ugHeaders(a, site, extra = {}, own) {
+  const h = {
     "Content-Type": "application/json",
     Authorization: `Cloud-IDE-JWT ${a.token}`,
     "User-Agent": ugUA(site),
@@ -677,8 +756,121 @@ function ugHeaders(a, site, extra = {}) {
     "x-device-type": "Windows",
     "x-os-version": "10.0.22631",
     "x-app-version": site.clientVersion,
-    ...extra,
   }
+  if (own) {
+    h["x-device-id"] = own.deviceId
+    h["x-device-type"] = own.type
+    h["x-os-version"] = own.os
+    delete h["x-device-brand"]
+  }
+  return { ...h, ...extra }
+}
+
+// ---- this machine's own Trae CN client ----------------------------------------------
+
+// Trae CN's desktop client keeps its state in a VS Code-style
+// globalStorage/storage.json. The device id Trae's device service gave
+// it is in a key's name, iCubeAuthInfo://icube-dc:<digits> (15 or 16
+// digits seen); its sign-in is the value of iCubeAuthInfo://icube.cloudide,
+// a JSON envelope (userId, token, …) stored as is or obfuscated with the
+// client's fixed AES-128-CBC codec. Seen in real clients' files
+// (yetone/magpie#808: the same id in the client's own did= query;
+// yetone/magpie#1705) and read the same way by dingminhua/dsh-connect-trae
+// (MIT), whose codec this is.
+const DC_KEY = "iCubeAuthInfo://icube-dc:"
+const AUTH_KEY = "iCubeAuthInfo://icube.cloudide"
+
+// ownClient.paths are where storage.json may be, in order; tests replace it
+const ownClient = {
+  paths: () => clientStoragePaths(process.platform, homedir(), process.env),
+}
+
+function clientStoragePaths(platform, home, env) {
+  const file = (root, name) => join(root, name, "User", "globalStorage", "storage.json")
+  if (platform === "darwin") return [file(join(home, "Library", "Application Support"), "Trae CN")]
+  if (platform === "win32") {
+    const roots = [env.APPDATA, join(home, "AppData", "Roaming")].filter((r, i, all) => r && all.indexOf(r) === i)
+    return roots.flatMap((r) => ["Trae CN", "trae-cn"].map((n) => file(r, n)))
+  }
+  if (platform === "linux") return ["trae-cn", "Trae CN"].map((n) => file(env.XDG_CONFIG_HOME || join(home, ".config"), n))
+  return []
+}
+
+// clientDevice is the device id of this machine's Trae CN client when the
+// client is signed in as uid, else undefined. It only reads: nothing of
+// the client's is written, kept or sent but that id, and the client's own
+// token is read past, never used. A file it can't read or make out, or one
+// with no single device, names no device, and the account keeps its own.
+// Never an id made up or changed: an account the client isn't signed in
+// as never gets the client's id.
+async function clientDevice(uid) {
+  if (!uid) return undefined
+  for (const p of ownClient.paths()) {
+    let text
+    try {
+      text = await readFile(p, "utf8")
+    } catch {
+      continue // not installed here
+    }
+    try {
+      const doc = JSON.parse(text)
+      const ids = Object.keys(doc ?? {}).filter((k) => k.startsWith(DC_KEY)).map((k) => k.slice(DC_KEY.length))
+      if (ids.length !== 1 || !/^\d{8,20}$/.test(ids[0])) return undefined
+      const who = clientAuth(doc[AUTH_KEY])?.userId
+      return who != null && String(who) === String(uid) ? ids[0] : undefined
+    } catch {
+      return undefined
+    }
+  }
+  return undefined
+}
+
+// clientAuth is the client's sign-in envelope, as stored or decoded
+function clientAuth(v) {
+  if (typeof v !== "string" || !v.trim()) return undefined
+  const t = v.trim()
+  return JSON.parse(t.startsWith("{") ? t : clientDecode(t))
+}
+
+const xorOf = (a, b) => Buffer.from(a.map((x, i) => x ^ b[i]))
+const CODEC = {
+  "746305100000": xorOf(
+    [82, 9, 106, 213, 48, 54, 165, 56, 191, 64, 163, 158, 129, 243, 215, 251, 124, 227, 57, 130, 155, 47, 255, 135, 52, 142, 67, 68, 196, 222, 233, 203, 84, 123, 148, 50, 166, 194, 35, 61, 238, 76, 149, 11, 66, 250, 195, 78, 8, 46, 161, 102, 40, 217, 36, 178, 118, 91, 162, 73, 109, 139, 209, 37],
+    [31, 221, 168, 51, 136, 7, 199, 49, 177, 18, 16, 89, 39, 128, 236, 95, 96, 81, 127, 169, 25, 181, 74, 13, 45, 229, 122, 159, 147, 201, 156, 239, 160, 224, 59, 77, 174, 42, 245, 176, 200, 235, 187, 60, 131, 83, 153, 97, 23, 43, 4, 126, 186, 119, 214, 38, 225, 105, 20, 99, 85, 33, 12, 125],
+  ),
+  "123920200203": xorOf(
+    [191, 192, 216, 250, 122, 246, 220, 97, 31, 254, 98, 27, 8, 72, 71, 176, 135, 99, 96, 18, 127, 101, 203, 104, 211, 102, 191, 125, 37, 72, 150, 156, 51, 229, 121, 35, 17, 153, 141, 177, 110, 131, 150, 128, 172, 255, 254, 6, 18, 140, 55, 62, 236, 249, 135, 64, 135, 12, 117, 4, 89, 149, 168, 209],
+    [246, 204, 26, 232, 232, 70, 129, 109, 223, 146, 169, 242, 23, 241, 105, 145, 50, 196, 165, 42, 254, 120, 3, 54, 244, 207, 209, 85, 53, 6, 138, 106, 175, 148, 31, 204, 186, 186, 165, 182, 87, 142, 49, 10, 39, 110, 26, 154, 86, 56, 173, 125, 18, 64, 198, 225, 99, 99, 83, 82, 191, 134, 76, 170],
+  ),
+}
+
+// clientDecode undoes the client's codec: a 6-byte header naming the salt,
+// 32 random bytes, then AES-128-CBC under sha512(sha512(random) + salt);
+// the plaintext is led by its own sha512, which is checked
+function clientDecode(b64) {
+  const buf = Buffer.from(b64, "base64")
+  const salt = CODEC[buf.subarray(0, 6).toString("hex")]
+  if (!salt || buf.length <= 102) throw new Error("not the client's codec")
+  const key = createHash("sha512").update(Buffer.concat([createHash("sha512").update(buf.subarray(6, 38)).digest(), salt])).digest()
+  const d = createDecipheriv("aes-128-cbc", key.subarray(0, 16), key.subarray(16, 32))
+  const out = Buffer.concat([d.update(buf.subarray(38)), d.final()])
+  const body = out.subarray(64)
+  if (out.length < 64 || !createHash("sha512").update(body).digest().equals(out.subarray(0, 64))) throw new Error("the client's value doesn't check")
+  return body.toString("utf8")
+}
+
+// thisMachine is how the client names this machine's OS: its type, and
+// the OS's own version (Windows' product name, as "Windows 11 Home China"
+// was seen, else its build; elsewhere the kernel's release)
+function thisMachine(platform = process.platform) {
+  if (platform === "win32") {
+    let v = ""
+    try {
+      v = osVersion()
+    } catch {}
+    return { type: "windows", os: /^Windows \d/.test(v) ? v : `Windows ${release()}` }
+  }
+  return { type: platform === "darwin" ? "mac" : platform, os: `${platform === "darwin" ? "macOS" : platform} ${release()}` }
 }
 
 // ugPage: url is one of Trae's growth pages (the check-in)
@@ -767,14 +959,72 @@ const nativeTools = (tools) =>
     return { type: "function", function: { name: f.name, description: f.description ?? "", parameters: typeof f.parameters === "string" ? f.parameters : JSON.stringify(f.parameters ?? {}) } }
   })
 
+// SESSION carries the conversation magpie (or OpenCode) names a request by,
+// from the chat.headers hook to the loader's fetch. It goes no further.
+const SESSION = "x-magpie-trae-session"
+
+// SALT is what the id is derived with, so it says nothing of the words it was
+// made from. New in each process, as Trae's own session ids are one session's
+// own within a run.
+const SALT = randomBytes(16).toString("hex")
+
+// conversationID is the conversation a chat belongs to, as the UUID the
+// request's session_id wants: the session magpie or OpenCode names (its
+// chat.headers hook), else the chat's first user message, which every later
+// turn of the conversation repeats. "" when neither names one — a body that
+// isn't a chat, or one with no user message in it — and the caller then makes
+// a fresh id per request, as before: a made-up conversation of the request's
+// own is the very splitting this is here to end.
+//
+// who is the account the request is made as (its uid, else its name), and it
+// is part of what the id is made of, so one conversation answered by two
+// accounts (magpie failing over, or rotating, inside it) is two conversations
+// as Trae is concerned — an id a fresh random one never linked, and one that
+// would let Trae read one conversation as another's. The cost is that such a
+// conversation's two halves are counted apart again, which is what it did
+// before this named one at all.
+function conversationID(chat, session, who = "") {
+  const account = String(who ?? "").trim()
+  if (session) return uuidOf("magpie-trae-session|" + account + "|" + session)
+  const first = (Array.isArray(chat?.messages) ? chat.messages : []).find((m) => m?.role === "user")
+  const text = partText(first?.content ?? "")
+  return text.trim() ? uuidOf("magpie-trae-first|" + account + "|" + text) : ""
+}
+
+// uuidOf is a version 4 UUID made of a hash's first 16 bytes: the shape
+// randomUUID() returns, since that is what session_id carried before.
+function uuidOf(s) {
+  const b = Buffer.from(createHash("sha256").update(SALT + "|" + s).digest().subarray(0, 16))
+  b[6] = (b[6] & 0x0f) | 0x40
+  b[8] = (b[8] & 0x3f) | 0x80
+  const h = b.toString("hex")
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`
+}
+
+// sessionOf takes the session a chat.headers hook named off the headers, with
+// the header: it goes no further than here. Its length is capped as magpie's
+// own session ids are, the id being derived from it anyway.
+function sessionOf(headers) {
+  const s = String(headers.get(SESSION) ?? "").trim()
+  headers.delete(SESSION)
+  return s.slice(0, 128)
+}
+
 // chatBody is the request for llm_utils_chat; modelName is the model the
 // function's list names for the config (its __dev one), when it named one,
 // and most the max_tokens it gives that model (0: none given), which a
 // request asking more is held to. A Max model (max: {base, window}) asks
 // the config base by its __max model, max_tokens always set, and gives
 // the prompt the room the window has beside it, as the IDE's Max mode does.
-function chatBody(req, fn, modelName, most = 0, max = null) {
-  const session = randomUUID()
+//
+// session is the conversation's id, made by conversationID, so every request
+// of one conversation carries one: Trae counts a conversation by the session
+// the requests name, and a request naming a new session each time is counted
+// as a conversation of its own — one user send that takes several steps (a
+// tool result sent back, a retry, another function answering) shows up in the
+// usage detail as several, each under no title at all. request_id stays a
+// fresh id per request, being that request's own.
+function chatBody(req, fn, modelName, most = 0, max = null, session = "") {
   const config = max?.base ?? req.model
   const body = {
     messages: traeMessages(req),
@@ -783,8 +1033,8 @@ function chatBody(req, fn, modelName, most = 0, max = null) {
     model: config,
     ...(modelName ? { model_name: modelName } : {}),
     stream: true, // Trae answers in SSE either way
-    request_id: session,
-    session_id: session,
+    request_id: randomUUID(),
+    session_id: session || randomUUID(),
   }
   const asked = req.max_completion_tokens ?? req.max_tokens
   if (Number.isFinite(asked) && asked > 0) body.max_tokens = most > 0 ? Math.min(Math.floor(asked), most) : Math.floor(asked)
@@ -861,13 +1111,35 @@ const eventName = (s) =>
     .toLowerCase()
     .replace(/^_|_$/g, "")
 
-// usageOf maps Trae's token counts to OpenAI's
+// tokensOf maps Trae's token counts to OpenAI's. Trae's token_usage event
+// (TRAE SOLO CN's ai-agent, TokenUsageEvent: name, prompt_tokens,
+// completion_tokens, total_tokens, reasoning_tokens,
+// cache_creation_input_tokens, cache_read_input_tokens,
+// prompt_tokens_total, completion_tokens_total) says what the prompt cache
+// read and wrote under Anthropic's names. They go on under those names,
+// which magpie reads beside prompt_tokens as it reads a relay's in front of
+// Claude (whether prompt_tokens counts them too is judged there, by
+// whether it is at least as big); without them every request read as no
+// cache hit (01huadalang on magpie's Discord: K3, 53 calls, all 0)
 function tokensOf(u) {
   if (!u || typeof u !== "object") return null
-  const p = Number(u.prompt_tokens ?? u.input_tokens ?? u.promptTokens ?? u.inputTokens ?? 0) || 0
-  const c = Number(u.completion_tokens ?? u.output_tokens ?? u.completionTokens ?? u.outputTokens ?? 0) || 0
+  const n = (...v) => Number(v.find((x) => x != null) ?? 0) || 0
+  const p = n(u.prompt_tokens, u.input_tokens, u.promptTokens, u.inputTokens)
+  const c = n(u.completion_tokens, u.output_tokens, u.completionTokens, u.outputTokens)
   if (!p && !c) return null
-  return { prompt_tokens: p, completion_tokens: c, total_tokens: Number(u.total_tokens ?? u.totalTokens) || p + c }
+  const out = { prompt_tokens: p, completion_tokens: c, total_tokens: n(u.total_tokens, u.totalTokens) || p + c }
+  const read = n(u.prompt_tokens_details?.cached_tokens)
+  const write = n(u.prompt_tokens_details?.cache_write_tokens)
+  if (read || write) out.prompt_tokens_details = { cached_tokens: read, ...(write ? { cache_write_tokens: write } : {}) }
+  else {
+    const r = n(u.cache_read_input_tokens, u.cacheReadInputTokens)
+    const w = n(u.cache_creation_input_tokens, u.cacheCreationInputTokens)
+    if (r) out.cache_read_input_tokens = r
+    if (w) out.cache_creation_input_tokens = w
+  }
+  const thought = n(u.reasoning_tokens, u.completion_tokens_details?.reasoning_tokens)
+  if (thought) out.completion_tokens_details = { reasoning_tokens: thought }
+  return out
 }
 
 let callSeq = 0
@@ -891,6 +1163,7 @@ class TextTools {
     this.tools = tools
     this.sent = "" // the text given out so far, to tell a block in code from a call
     this.bad = new Set() // where the waiting block's JSON was tried and not read, not tried again
+    this.mark = 0 // where in sent the text after the last call starts
   }
   push(s, end = false) {
     this.buf += s
@@ -913,6 +1186,27 @@ class TextTools {
       const i = om ? om.index : -1
       const d = this.buf.search(DSML_AT)
       const r = this.buf.search(REASON_AT)
+      const sm = this.buf.match(STRAY_AT)
+      const s = sm ? sm.index : -1
+      if (s >= 0 && [i, d, r].every((x) => x < 0 || s < x)) {
+        // a close with no call open, with what GLM left before it
+        // (}}</tool_call>, magpie#1945): not the answer, dropped; in code,
+        // shown
+        const head = this.buf.slice(0, s)
+        // only a tail: a close with nothing before it since the last call
+        // (or the start), or with GLM's braces, quotes or > right before
+        // it; a close a sentence names in passing stays
+        const tail = /^[}\]"'>]/.test(sm[0]) || !(this.sent + text + head).slice(this.mark).trim()
+        if (!tail || quoted(this.sent + text + head)) {
+          text += this.buf.slice(0, s + sm[0].length)
+          this.buf = this.buf.slice(s + sm[0].length)
+          continue
+        }
+        text += head
+        this.buf = this.buf.slice(s + sm[0].length)
+        this.after = true
+        continue
+      }
       if (r >= 0 && (i < 0 || r < i) && (d < 0 || r < d)) {
         const o = objectEnd(this.buf, r)
         if (o === -1 && !end) {
@@ -964,6 +1258,7 @@ class TextTools {
           stop = body.length
         }
         calls.push({ name: inv[1], arguments: dsmlArgs(body.slice(0, stop)) })
+        this.mark = this.sent.length + text.length
         this.buf = body.slice(c && c.index === stop ? stop + c[0].length : stop)
         this.after = true
         continue
@@ -1005,10 +1300,20 @@ class TextTools {
         return { text, calls, reasoning, error: b.error }
       }
       calls.push(b.call)
+      this.mark = this.sent.length + text.length
       this.buf = b.rest
       this.after = true
     }
     if (end) {
+      // an opener the stream ended inside (<tool_call name): a call cut
+      // short, not the answer (plugins#38)
+      const h = this.buf.search(OPEN_HOLD)
+      if (h >= 0 && !quoted(this.sent + text + this.buf.slice(0, h))) {
+        text += this.buf.slice(0, h)
+        this.buf = ""
+        this.sent += text
+        return { text, calls, reasoning, error: CUT_SHORT }
+      }
       text += this.buf
       this.buf = ""
     } else {
@@ -1016,6 +1321,9 @@ class TextTools {
       const at = [this.buf.search(OPEN_AT), this.buf.search(OPEN_HOLD), this.buf.search(DSML_AT), this.buf.search(REASON_AT)].filter((x) => x >= 0)
       let keep = at.length ? this.buf.length - Math.min(...at) : 0
       if (!keep) for (let k = Math.min(MARK_MAX - 1, this.buf.length); k > 0; k--) if (MARKS.some((m) => m.startsWith(this.buf.slice(-k)))) { keep = k; break }
+      // and braces, brackets, quotes or a > a close may still come after
+      const sh = this.buf.slice(0, this.buf.length - keep).match(STRAY_HOLD)
+      if (sh) keep = this.buf.length - sh.index
       text += this.buf.slice(0, this.buf.length - keep)
       this.buf = this.buf.slice(this.buf.length - keep)
     }
@@ -1030,11 +1338,11 @@ class TextTools {
   // gave as <tool_call name="…">.
   block(body, named, end) {
     if (!end && !body.trim()) return { wait: true }
-    const close = body.indexOf(CLOSE)
+    const [close, closeLen] = closeAt(body)
     if (named) {
       if (close < 0 && !end) return { wait: true }
       const region = close >= 0 ? body.slice(0, close) : body
-      const rest = close >= 0 ? body.slice(close + CLOSE.length) : ""
+      const rest = close >= 0 ? body.slice(close + closeLen) : ""
       if (region.trimStart().startsWith("{")) {
         const v = repairedJSON(region.trim())
         if (!v) return { error: close >= 0 ? UNREADABLE : CUT_SHORT }
@@ -1058,22 +1366,41 @@ class TextTools {
         const region = body.slice(ph[0].length, close >= 0 ? close : body.length)
         const p = paramArgs(region, ph[1], this.tools)
         if (close < 0 && !p.closed) return { error: CUT_SHORT }
-        return { call: { name: ph[1], arguments: JSON.stringify(p.args) }, rest: close >= 0 ? body.slice(close + CLOSE.length) : "" }
+        return { call: { name: ph[1], arguments: JSON.stringify(p.args) }, rest: close >= 0 ? body.slice(close + closeLen) : "" }
       }
       const o = objectEnd(body, 0)
       if (o > 0 && !this.bad.has(":" + o)) {
         const v = callJSON(body.slice(0, o))
         // a name alone may have its parameters still to come
         if (v && !end && Object.keys(v).length === 1 && "<parameter".startsWith(body.slice(o).replace(/^\s*>?\s*/, ""))) return { wait: true }
-        if (v) return { call: { name: String(v.name), arguments: callArgs(v) }, rest: body.slice(o) }
-        this.bad.add(":" + o)
+        if (v) {
+          // what follows the object up to the close: GLM leaves braces,
+          // brackets, quotes or a > of its own there (}}</tool_call>,
+          // "></tool_call>, magpie#1945), dropped with the close; held
+          // while only those have come
+          const tail = body.slice(o)
+          const junk = tail.match(TAIL_JUNK)[0]
+          const next = tail.slice(junk.length)
+          const call = { name: String(v.name), arguments: callArgs(v) }
+          if (!end && (!next || ["</tool_call>", "</toolcall>"].some((k) => k.startsWith(next)))) return { wait: true }
+          const [c, n] = closeAt(next)
+          if (c === 0) return { call, rest: next.slice(n) }
+          // after blanks alone, or with no close to come: the call, and
+          // what follows read on as before. Other text before the close
+          // right after the object means the object ended early, at a
+          // quote inside a string left unescaped: that cut is wrong (a
+          // heredoc's command cut short, magpie#1945), so it is read up to
+          // the close below, or not at all
+          if (!/\S/.test(junk) && !/^[^\s<]/.test(next)) return { call, rest: tail }
+          if (close < 0 && end) return { call, rest: tail }
+        } else this.bad.add(":" + o)
       }
       // not whole, or not JSON as it stands: read up to a close (a file's
       // content may hold one), or at the end all of it
-      for (let j = close; j >= 0; j = body.indexOf(CLOSE, j + 1)) {
+      for (let [j, n] = [close, closeLen]; j >= 0; [j, n] = closeAt(body, j + 1)) {
         if (this.bad.has("<" + j)) continue
         const v = callJSON(body.slice(0, j))
-        if (v) return { call: { name: String(v.name), arguments: callArgs(v) }, rest: body.slice(j + CLOSE.length) }
+        if (v) return { call: { name: String(v.name), arguments: callArgs(v) }, rest: body.slice(j + n) }
         this.bad.add("<" + j)
       }
       if (!end) return { wait: true }
@@ -1087,7 +1414,7 @@ class TextTools {
     const region = close >= 0 ? body.slice(0, close) : body
     const w = glmCall(region, this.tools)
     // GLM's call, cut short at the end, is still the call
-    if (w) return { call: { name: w.name, arguments: callArgs(w) }, rest: close >= 0 ? body.slice(close + CLOSE.length) : "" }
+    if (w) return { call: { name: w.name, arguments: callArgs(w) }, rest: close >= 0 ? body.slice(close + closeLen) : "" }
     if (/^\s*[\w.:-]{1,128}\s*<arg_key>/.test(body)) return { error: close >= 0 ? UNREADABLE : CUT_SHORT }
     return { text: true }
   }
@@ -1097,9 +1424,26 @@ const CUT_SHORT = "the model's tool call, written as text, was cut short; it is 
 const UNREADABLE = "the model's tool call, written as text, can't be read; it is not sent on as the answer"
 
 // an opener: <tool_call>, one with attributes (<tool_call name="bash">),
-// or <tool_call right before its JSON; and one still being written
-const OPEN_AT = /<tool_call(?:(\s[^<>{}]*)?>|(?=\s*\{))/
-const OPEN_HOLD = /<tool_call(?:\s[^<>{}\n]{0,200})?$/
+// or <tool_call right before its JSON; and one still being written. GLM
+// also writes it without the underscore, <toolcall> (plugins#38)
+const OPEN_AT = /<tool_?call(?:(\s[^<>{}]*)?>|(?=\s*\{))/
+const OPEN_HOLD = /<tool_?call(?:\s[^<>{}\n]{0,200})?$/
+// what GLM leaves between a call's JSON and its close: blanks, closing
+// braces and brackets, quotes, a > (magpie#1945)
+const TAIL_JUNK = /^[\s}\]"'>]*/
+// a close with no call open, and that leftover before it: the tail of a
+// call Trae's service read itself, or of one already read (magpie#1945)
+const STRAY_AT = /[}\]"'>]*\s*<\/tool_?calls?>/
+// the end of text that may be such a tail still being written
+const STRAY_HOLD = /[}\]"'>][\s}\]"'>]*$/
+// closeAt is where the next close is from i, </tool_call> or </toolcall>,
+// and its length: [-1, 0] when there is none
+function closeAt(s, i = 0) {
+  const re = /<\/tool_?call>/g
+  re.lastIndex = i
+  const m = re.exec(s)
+  return m ? [m.index, m[0].length] : [-1, 0]
+}
 // DeepSeek's half-and-half call: {"name":"x"} (or its brace or > left
 // out), then <parameter name="k">v</parameter> or Qwen's <parameter=k>
 const PARAM_HEAD = /^\s*\{\s*"name"\s*:\s*"([^"]+)"\s*\}?\s*>?\s*(?=<parameter\b)/
@@ -1245,7 +1589,7 @@ const GLM_ARG = /<arg_key>\s*([\s\S]*?)\s*<\/arg_key>\s*<arg_value>([\s\S]*?)<\/
 // a value that isn't a string. A name alone is a call only to a tool the
 // request has.
 function glmCall(s, tools = []) {
-  s = String(s ?? "").replace(/<\/tool_call>\s*$/, "")
+  s = String(s ?? "").replace(/<\/tool_?call>\s*$/, "")
   const k = s.indexOf("<arg_key>")
   const name = (k < 0 ? s : s.slice(0, k)).trim()
   if (!/^[\w.:-]{1,128}$/.test(name)) return null
@@ -1268,6 +1612,165 @@ function glmCall(s, tools = []) {
   return { name, arguments: args }
 }
 
+// Trae reads a model's call for it and hands a call it could not read on as
+// the native call: the wrapper the client's prompt asked for, with GLM's own
+// template tags where the model wrote them and a field's close left behind
+// (``{"name":"bash","arguments":{"command</arg_key><arg_value>ls</arg_value>``).
+// The name then holds the call the model meant, and the call's own arguments
+// — where the model wrote them — hold the rest of it.
+const NAMECALL = /^\s*\{\s*"name"\s*:\s*"([^"\\]*)"\s*,\s*"(?:arguments|input|parameters)"\s*:\s*\{/
+// a wrapper the service put text in front of (`bash_abstract_command_0>{…}`):
+// the same shape, wherever it starts
+const NAMEHEAD = /\{\s*"name"\s*:\s*"([^"\\]*)"\s*,\s*"(?:arguments|input|parameters)"\s*:\s*\{/
+const NAMETAG = /<\/?arg_(?:key|value)\s*>/
+
+// nameCall is the call a name holds when it is one the model wrote there
+// ({name, arguments}), null when it isn't: a name without the wrapper, one
+// whose tool the request doesn't have, or one no field could be read from.
+// The wrapper and the tags are the service's own handoff, so what stands
+// between them is the model's text as it wrote it — a quote it left
+// unescaped is read as the quote it is, the way repairedJSON reads a file's
+// content. A value is JSON where the tool's schema says the field is no
+// string and the text is one; else the text, cut where the value was cut.
+function nameCall(s, tools = []) {
+  const text = String(s ?? "")
+  // a wrapper the service put text in front of (`bash_abstract_command_0>{…}`)
+  // is the call it holds, that text being no name the request has
+  const at = text.indexOf("{")
+  if (at < 0) return null
+  const m = NAMECALL.exec(text.slice(at))
+  if (!m) return null
+  const name = m[1]
+  const tool = tools.map((t) => t.function ?? t).find((t) => t?.name === name)
+  if (!tool) return null
+  const fields = nameFields(text.slice(at + m[0].length))
+  const args = {}
+  for (const [key, value] of fields) {
+    // a field the schema says is no string is its JSON where it is one (a
+    // number the model wrote, an object), else the text it is
+    if (tool.parameters?.properties?.[key]?.type !== "string") {
+      try {
+        args[key] = JSON.parse(value.trim())
+        continue
+      } catch {}
+    }
+    args[key] = value
+  }
+  return Object.keys(args).length ? { name, arguments: args } : null
+}
+
+// nameFields reads a wrapper's body as its fields: a key, then its value.
+// A tag stands where the service cut a colon or a quote, so a value ends at
+// the tag that ends it, at the next key, or at the structure that closes it
+// — and at a closing tag (`</description>`) whose name is a field's, because
+// what follows such a tag is the service's own text, not the model's.
+// What none of those reached is no field's text and is left out, so a call
+// cut in the middle keeps what it has.
+function nameFields(body) {
+  const out = []
+  let i = 0
+  for (let n = 0; n < 64 && i < body.length; n++) {
+    // between fields: blanks, a comma, or the tags that stand for either
+    i += (body.slice(i).match(/^[\s,]+|^<\/?[a-z_]+\s*>/) || [""])[0].length
+    if (body[i] !== '"') break
+    const key = nameString(body, i, () => true)
+    i = key.i
+    if (!key.text) break
+    const colon = body.slice(i).match(/^\s*:\s*/)
+    if (colon) i += colon[0].length
+    // a value the service cut at its tag: what stands after the tag is the
+    // model's text (limit</arg_key><arg_value>55)
+    i += (body.slice(i).match(/^(?:<\/?[a-z_]+\s*>)+/) || [""])[0].length
+    let value
+    if (body[i] === '"') {
+      const v = nameString(body, i, (rest) => endsValue(rest))
+      value = v.text
+      i = v.i
+      if (!value && !v.closed) break // an open quote with nothing in it
+    } else {
+      const rest = body.slice(i)
+      const stop = valueEnd(rest)
+      value = rest.slice(0, stop).replace(/^[\s,:]+/, "")
+      // the field's own close: the structure that follows it, and a quote
+      // the service cut it at where an escape isn't what stands before it
+      value = value.replace(/[\s,}\]]+$/, "").replace(/(?<!\\)"$/, "").replace(/[\s,}\]]+$/, "")
+      i += stop
+      // nothing introduced a value (no colon, no quote, no tag) and none
+      // stands: the wrapper is cut at the key, and an empty call read out
+      // of it would be a call the model never wrote
+      if (!value) break
+    }
+    out.push([key.text, value])
+  }
+  return out
+}
+
+// endsValue is what may stand after a string's closing quote: the structure
+// that closes the field (`,`, `}`, `]`, the end), a tag that stands for one,
+// or the next field's key.
+function endsValue(rest) {
+  if (/^\s*(?:[,}\]$]|<\/?[a-z_]+\s*>)/.test(rest)) return true
+  return /^\s*"(?:[^"\\]|\\.)*"\s*(?::|<\/?[a-z_]+\s*>)/.test(rest)
+}
+
+// valueEnd is where an unquoted value runs out: the next key, a tag that
+// ends it, or the structure that closes the field. A comma inside it is the
+// model's own (sed -n 1,9p), so only a brace or a bracket closes a field.
+function valueEnd(rest) {
+  const stops = [
+    rest.search(/"(?:(?:[^"\\<>]*)"\s*(?::|,|\s*<\/?[a-z_]+\s*>)|[^"\\<>]*<\/?[a-z_]+\s*>)/),
+    rest.search(/<\/?[a-z_]+\s*>/),
+    rest.search(/[}\]]/),
+  ].filter((x) => x >= 0)
+  return stops.length ? Math.min(...stops) : rest.length
+}
+
+// nameString reads the string at s[i] === '"', its escapes kept as written.
+// ends says, for what follows a quote, whether that quote ended the string:
+// a quote the model left unescaped inside a value is escaped as read on.
+// `closed` is whether the model's own quote ended it, where the read ran
+// into a tag or the end of the text.
+function nameString(s, i, ends) {
+  i++ // the opening quote
+  let src = ""
+  while (i < s.length) {
+    const ch = s[i]
+    if (ch === "\\") {
+      src += s[i] + (s[i + 1] ?? "")
+      i += 2
+      continue
+    }
+    if (ch === "<") {
+      // a tag ends the run: the service cut the value at it, whether it is
+      // one of its own (`</arg_value>`) or a field's (`</description>`),
+      // for neither is text the model wrote
+      if (/^<\/?[a-z_][\w-]*\s*>/.test(s.slice(i))) break
+    }
+    if (ch === '"') {
+      if (ends(s.slice(i + 1))) {
+        i++
+        return { text: decode(src), i, closed: true }
+      }
+      src += '\\"'
+      i++
+      continue
+    }
+    src += ch
+    i++
+  }
+  return { text: decode(src), i, closed: false }
+}
+
+// decode is a string's own source as the string: the escapes the model wrote
+// are the characters they stand for, a newline among them
+function decode(src) {
+  try {
+    return JSON.parse('"' + escapeRaw(src) + '"')
+  } catch {
+    return src
+  }
+}
+
 // toolNamed is the request's own name for a tool a model named otherwise
 // (Read for read, list-files for list_files); name itself when the request
 // has none like it. A tool it has none of goes on as named: the agent tells
@@ -1280,6 +1783,31 @@ function toolNamed(name, tools) {
   return names.find((n) => norm(n) === norm(name)) ?? name
 }
 
+// unwrapped is a call's arguments with the layer a model put around them
+// taken off: asked for {"name":…,"arguments":{…}}, some write the
+// arguments as {"arguments":{…}} again, natively or in the block, and the
+// agent got {"arguments":{"content":…,"path":…}} for its write (bee2an on
+// X). A lone arguments, input, parameters or args key holding an object is
+// that layer when the tool has no parameter of that name.
+const WRAPS = ["arguments", "input", "parameters", "args"]
+function unwrapped(args, name, tools) {
+  const t = tools.map((x) => x.function ?? x).find((f) => f?.name === name)
+  if (!t) return args
+  const props = t.parameters?.properties ?? {}
+  let v = looseJSON(args)
+  let changed = false
+  for (let k = 0; k < 3 && v && typeof v === "object" && !Array.isArray(v); k++) {
+    const keys = Object.keys(v)
+    if (keys.length !== 1 || !WRAPS.includes(keys[0]) || keys[0] in props) break
+    let inner = v[keys[0]]
+    if (typeof inner === "string") inner = looseJSON(inner)
+    if (!inner || typeof inner !== "object" || Array.isArray(inner)) break
+    v = inner
+    changed = true
+  }
+  return changed ? JSON.stringify(v) : args
+}
+
 // DeepSeek's tags, with its full-width bar or a plain one
 const DSML = String.raw`<\s*\/?\s*[|｜][\s|｜]*DSML[\s|｜]*`
 const DSML_AT = new RegExp(DSML)
@@ -1290,9 +1818,9 @@ const DSML_CLOSE = new RegExp(String.raw`<\s*\/\s*[|｜][\s|｜]*DSML[\s|｜]*in
 const DSML_PARAM = new RegExp(String.raw`<\s*[|｜][\s|｜]*DSML[\s|｜]*parameter\s+name\s*=\s*"([^"]+)"((?:\s+\w+\s*=\s*"[^"]*")*)\s*>([\s\S]*?)` + DSML + String.raw`parameter\s*>`, "g")
 // what is left after a call: blanks, our close, DeepSeek's tags but the
 // next call's
-const LEFTOVER = new RegExp(String.raw`^(?:\s+|<\/tool_calls?>|<tool_calls>|` + DSML + String.raw`(?![\s|｜]*invoke\b)[^<>]*>)+`)
+const LEFTOVER = new RegExp(String.raw`^(?:\s+|<\/tool_?calls?>|<tool_?calls>|` + DSML + String.raw`(?![\s|｜]*invoke\b)[^<>]*>)+`)
 // what text may be the start of, so held back
-const MARKS = [OPEN, CLOSE, "<｜DSML｜", "<|DSML|", "</｜DSML｜", "</|DSML|", '{"reasoning_content"']
+const MARKS = [OPEN, CLOSE, "<toolcall>", "</toolcall>", "<｜DSML｜", "<|DSML|", "</｜DSML｜", "</|DSML|", '{"reasoning_content"']
 // reasoning a model wrote into its text as JSON
 const REASON_AT = /\{\s*"reasoning_content"\s*:/
 const MARK_MAX = Math.max(...MARKS.map((m) => m.length))
@@ -1434,17 +1962,45 @@ class NativeCalls {
   }
   take(tools = []) {
     return this.calls.filter((c) => c.name).map(({ id, name, arguments: a }) => {
-      // a name that holds the whole call, as JSON or in GLM's template:
-      // that call, its arguments the name's when it gave none of its own
-      const w = name.trimStart().startsWith("{") ? looseJSON(name) : name.includes("<arg_key>") ? glmCall(name, tools) : null
+      // a name that holds the whole call, as the client's wrapper or in
+      // GLM's template: that call, its arguments the name's when it gave
+      // none of its own. The wrapper is read as JSON where it is whole —
+      // its nesting is its own — and as the service's handoff where it was
+      // left mid-call, a wrapper written with a space (`{ "name"`) whole
+      // like any other
+      const w = name.trimStart().startsWith("{") ? looseJSON(name) ?? nameCall(name, tools)
+        : NAMEHEAD.test(name) ? nameCall(name, tools)
+        : name.includes("<arg_key>") ? glmCall(name, tools) : null
       if (w?.name) {
         name = String(w.name)
-        if (!a || a.trim() === "{}") a = callArgs(w)
+        // the name's own arguments are the model's; what the name read fills
+        // the fields they left (the wrapper's text is the whole call where
+        // Trae moved the arguments with it, and the rest where it did not)
+        a = nameArgs(a, w)
       }
       const v = a && !done(a) ? looseJSON(a) : null
       return { id: id || callId(), name, arguments: v ? JSON.stringify(v) : a || "{}" }
     })
   }
+}
+
+// nameArgs is the arguments of a call a name held: the native call's own
+// where it carried them, else the name's, and the two together where each
+// has a field the other hasn't — the service moves the arguments it read
+// into the native call and leaves the rest in the name. The name's side is
+// read the way main reads a whole name (`callArgs`: `arguments`, `input`,
+// `parameters`, arguments given as a string, or the flat fields), so what
+// main already read keeps reading the same. The two stand together only as
+// two sets of fields; a call's own arguments that are not that — text the
+// service cut, or a value that isn't a call's fields — go on as they stand,
+// which is what main passed on and what the agent can answer.
+function nameArgs(native, fromName) {
+  const a = typeof native === "string" ? native.trim() : ""
+  const named = callArgs(fromName)
+  if (!a || a === "{}") return named
+  const own = looseJSON(a), side = looseJSON(named)
+  if (!own || !side || typeof own !== "object" || typeof side !== "object" || Array.isArray(own) || Array.isArray(side)) return a
+  return JSON.stringify({ ...side, ...own })
 }
 
 // resent says next is the call's whole arguments sent again after a
@@ -1511,7 +2067,10 @@ async function* parts(events, tools = []) {
   const tt = new TextTools(tools)
   const nc = new NativeCalls()
   const th = new Thoughts()
-  const call = (c) => ({ call: { ...c, name: toolNamed(c.name, tools) } })
+  const call = (c) => {
+    const name = toolNamed(c.name, tools)
+    return { call: { ...c, name, arguments: unwrapped(c.arguments, name, tools) } }
+  }
   let finish = ""
   for await (const { event, data } of events) {
     const name = eventName(event)
@@ -1888,9 +2447,16 @@ const makePlugin = (site) => async ({ client }) => {
     const ug = ugPage(url)
     let sent = method === "GET" || method === "HEAD" ? undefined : typeof body === "string" ? body : "{}"
     if (ug && sent !== undefined && /^\s*(\{\s*\})?\s*$/.test(sent)) sent = JSON.stringify({ req_source: 1 })
+    // the account this machine's own Trae CN client is signed in as checks
+    // in on the client's device, the one Trae registered: on one account
+    // the client's own claim went through while the plugin's, on a device
+    // it had made up, came back 9074 (yetone/magpie#808, #1920). Every
+    // other account keeps its own device; none is given the client's.
+    const deviceId = ug && site.id === "trae-cn" ? await clientDevice(a.uid) : undefined
+    const own = deviceId ? { deviceId, ...thisMachine() } : undefined
     const res = await fetch(url, {
       method,
-      headers: ug ? ugHeaders(a, site, { Accept: "application/json" }) : ideHeaders(a, site, { Accept: "application/json" }),
+      headers: ug ? ugHeaders(a, site, { Accept: "application/json" }, own) : ideHeaders(a, site, { Accept: "application/json" }),
       body: sent,
       signal: signal ?? AbortSignal.timeout(20_000),
     })
@@ -1984,24 +2550,40 @@ const makePlugin = (site) => async ({ client }) => {
     // deepseek-v4.1-flash "DeepSeek-V4-Flash 正式版", as it does
     // DeepSeek-V4-Flash-Official, where SOLO's lists call it
     // DeepSeek-V4.1-Flash (yetone/magpie#681) — Trae's usage page then books
-    // it under that name too. Such an entry is misnamed: its name is another
-    // model's in the same list, and other lists name it otherwise.
+    // a request under the name of the list it was served through. Such an
+    // entry is misnamed: its name is another model's in the same list, and
+    // other lists name it otherwise.
     const nameOf = (m) => String(m.display_config?.display_name || m.display_name || m.display_model_name || m.config_name)
-    const names = new Map() // id → the names its lists give it
+    const names = new Map() // id → the names its lists give it, and how many give each
     for (const fn of site.functions) {
       for (const m of lists[fn] ?? []) {
         if (!chatModel(m, site)) continue
-        const id = String(m.config_name)
-        names.set(id, (names.get(id) ?? new Set()).add(nameOf(m)))
+        const id = String(m.config_name), name = nameOf(m)
+        const by = names.get(id) ?? new Map()
+        by.set(name, (by.get(name) ?? 0) + 1)
+        names.set(id, by)
       }
+    }
+    // the name most of a model's lists give it: the one Trae's own client is
+    // served under, and so the one its usage page books it as. Trae renames
+    // entries when it likes, and its 2026-10-09 rename of
+    // DeepSeek-V4-Flash-Official left chat_v3 the only list still calling
+    // deepseek-v4.1-flash by another's name — which neither signal above
+    // catches. A tie leaves the name to its entry.
+    const agreed = new Map() // id → that name, "" when the lists tie
+    for (const [id, by] of names) {
+      const top = Math.max(...by.values())
+      const most = [...by].filter(([, n]) => n === top)
+      agreed.set(id, most.length === 1 ? most[0][0] : "")
     }
     const misnamed = (fn, m) => {
       const id = String(m.config_name), name = nameOf(m)
       return names.get(id).size > 1 && (lists[fn] ?? []).some((o) => chatModel(o, site) && String(o.config_name) !== id && nameOf(o) === name)
     }
     // a function's entry is worth more when it names a __dev model, then
-    // when it isn't misnamed; the first of the best is taken
-    const worth = (fn, m) => (devModel(m) ? 2 : 0) + (misnamed(fn, m) ? 0 : 1)
+    // when it isn't misnamed, then when it carries the name its lists agree
+    // on; the first of the best is taken
+    const worth = (fn, m) => (devModel(m) ? 2 : 0) + (misnamed(fn, m) ? 0 : 1) + (nameOf(m) === agreed.get(String(m.config_name)) ? 1 : 0)
     const out = new Map()
     for (const fn of site.functions) {
       for (const m of lists[fn] ?? []) {
@@ -2017,8 +2599,11 @@ const makePlugin = (site) => async ({ client }) => {
       if (dev) modelNames.set(id, { fn, name: dev.model_name, most: Number(dev.max_tokens) || 0 })
       else modelNames.delete(id)
       if (out.has(id + MAX)) continue
-      // its Max is asked through the function whose entry names the __max model
-      const entries = [{ m, fn }, ...site.functions.flatMap((f) => (lists[f] ?? []).filter((o) => o !== m && chatModel(o, site) && String(o.config_name) === id).map((o) => ({ m: o, fn: f })))]
+      // its Max is asked through the function whose entry names the __max
+      // model, the entries carrying the agreed name first: Trae books the
+      // Max under that name too
+      const plain = (e) => (nameOf(e.m) === agreed.get(id) ? 0 : 1)
+      const entries = [{ m, fn }, ...site.functions.flatMap((f) => (lists[f] ?? []).filter((o) => o !== m && chatModel(o, site) && String(o.config_name) === id).map((o) => ({ m: o, fn: f })))].sort((a, b) => plain(a) - plain(b))
       const max = maxModel(...entries.map((e) => e.m))
       maxes.set(id, max)
       if (max) {
@@ -2077,6 +2662,14 @@ const makePlugin = (site) => async ({ client }) => {
         ...was,
         models: { ...site.models, ...(was.models ?? {}) },
       }
+    },
+    // the conversation's id, which the requests below carry as their
+    // session_id: magpie's (or OpenCode's) session for this request, when it
+    // names one
+    "chat.headers": async (input, output) => {
+      const id = input?.model?.providerID ?? input?.provider?.info?.id
+      if (id !== site.id || !input?.sessionID) return
+      output.headers[SESSION] = String(input.sessionID).slice(0, 128)
     },
     provider: {
       id: site.id,
@@ -2156,11 +2749,16 @@ const makePlugin = (site) => async ({ client }) => {
               if (outer.aborted) ac.abort()
               else outer.addEventListener("abort", () => ac.abort(), { once: true })
             }
+            // the conversation this request belongs to, from the chat.headers
+            // hook (magpie's session) or the chat's own first user message, as
+            // the account answering it, so a failover inside one conversation
+            // is not one Trae reads as another's
+            const session = conversationID(req, sessionOf(new Headers(init.headers ?? r0?.headers ?? {})), who)
             for (const fn of [...new Set(fns)]) {
               const res = await fetch(apiOf(a, site) + "/api/agent/v3/llm_utils_chat", {
                 method: "POST",
                 headers: ideHeaders(a, site, { Accept: "text/event-stream", "X-Request-ID": randomUUID() }),
-                body: JSON.stringify(chatBody(req, fn, named?.fn === fn || max ? named.name : "", named?.fn === fn || max ? named.most : 0, max)),
+                body: JSON.stringify(chatBody(req, fn, named?.fn === fn || max ? named.name : "", named?.fn === fn || max ? named.most : 0, max, session)),
                 signal: ac.signal,
               })
               if (!res.ok) {
@@ -2211,4 +2809,4 @@ const makePlugin = (site) => async ({ client }) => {
 export const TraeCNAuthPlugin = makePlugin(SITES["trae-cn"])
 export const TraeGlobalAuthPlugin = makePlugin(SITES["trae-global"])
 
-export const _internal = { HOSTS: SITES["trae-cn"].hosts, MODELS: SITES["trae-cn"].models, TextTools, NativeCalls, looseJSON, glmCall, toolNamed, traeMessages, chatBody, credits, dollarUsageOf, whenOf, newDevice, proofOf, SITES }
+export const _internal = { ownClient, clientStoragePaths, clientDevice, clientDecode, thisMachine, traeHost, accountOf, HOSTS: SITES["trae-cn"].hosts, MODELS: SITES["trae-cn"].models, TextTools, NativeCalls, looseJSON, glmCall, nameCall, toolNamed, unwrapped, traeMessages, chatBody, credits, dollarUsageOf, whenOf, newDevice, proofOf, SITES, SESSION, conversationID }

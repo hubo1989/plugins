@@ -151,12 +151,18 @@ const ASK = { method: "POST", body: JSON.stringify({ model: "qmodel", messages: 
 
 test("a refused chat, 401 or 403, is the built-in's 401 and leaves the account unmarked", async () => {
   for (const status of [401, 403]) {
-    const { fetch } = await chat(LISTING, () => new Response("nope", { status }))
+    const { fetch } = await chat(LISTING, () => new Response("", { status }))
     const res = await fetch(API_CHAT, ASK)
     expect(res.status).toBe(401)
     expect(res.headers.get("X-Magpie-Sign-In")).toBe("kept")
     expect((await res.json()).error.message).toBe("the sign-in lapsed — sign in again")
   }
+  // what Qoder says of the refusal is kept: a 401 just after signing in
+  // has some other reason, and only Qoder's words tell it
+  const said = await chat(LISTING, () => new Response(JSON.stringify({ message: "device not trusted" }), { status: 401 }))
+  const r = await said.fetch(API_CHAT, ASK)
+  expect([r.status, r.headers.get("X-Magpie-Sign-In")]).toEqual([401, "kept"])
+  expect((await r.json()).error.message).toBe("the sign-in lapsed — sign in again (Qoder said 401: device not trusted)")
   // refused in the stream, before any answer: the same
   const sse = (v) => new Response(`data: ${JSON.stringify(v)}\n\n`, { headers: { "Content-Type": "text/event-stream" } })
   const { fetch } = await chat(LISTING, () => sse({ statusCodeValue: 403, body: "" }))

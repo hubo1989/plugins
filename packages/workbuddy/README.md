@@ -24,7 +24,8 @@ The package exports `WorkBuddyAuthPlugin` (`workbuddy`) and
   - Windows: `~/AppData/Local/CodeBuddyExtension/…`
   - Linux: `~/.local/share/CodeBuddyExtension/…`
 
-  A sign-in the app keeps encrypted can't be read, and this way fails.
+  WorkBuddy 5.6 and later keep the sign-in encrypted, which only the app
+  opens, so this way fails there and says so: use the browser sign-in.
 
 A browser sign-in is kept as an OpenCode `oauth` auth: the access and
 refresh tokens, their expiry, the user id and the domain; desktop's as a
@@ -42,6 +43,14 @@ is never spent twice. A failed renewal, a refresh token past its end
 included, doesn't mark the account, as the built-in never did; magpie
 tries again later, and the old token is used meanwhile.
 OpenCode doesn't call `auth.refresh`; the check before each request stays.
+
+An enterprise (team) account is asked for as the enterprise. A browser
+sign-in keeps the enterprise id WorkBuddy names for the account (from
+`/login/account`, else its account list), and desktop's is read from the
+app's file. Every request then carries `X-Enterprise-Id` and `X-Tenant-Id`,
+as WorkBuddy's own client sends them; without them WorkBuddy answers as the
+personal account, with the personal plan's models. A browser sign-in made
+before 0.1.13 has no enterprise id kept: sign in again.
 
 Desktop's sign-in is refreshed only when the app hasn't refreshed it
 itself, and the new token is kept in memory, never written back, as magpie's
@@ -74,6 +83,11 @@ Each chat carries WorkBuddy's headers:
 A chat that doesn't open with a system message is given WorkBuddy's
 default one, as the app does.
 
+The loader also translates OpenAI-compatible request spellings WorkBuddy
+doesn't take: `max_completion_tokens` becomes `max_tokens`, `developer`
+messages become `system`, and an object `tool_choice` becomes WorkBuddy's
+string form.
+
 A chat's tools are given shapes WorkBuddy's models take. Without them
 WorkBuddy AI answers 400 "Invalid request parameters" (11133), DeepSeek's
 models to each shape below and Kimi's, GPT's, Gemini's and GLM's to some:
@@ -81,9 +95,26 @@ models to each shape below and Kimi's, GPT's, Gemini's and GLM's to some:
   `allOf`) at the root are an object, the union's fields merged;
 - a `pattern`'s `\0` is `\u0000`, which matches the same;
 - a tuple's `items` (a list) is one schema any of them fits;
+- an `enum` with no `type` takes its values' type (or that and `"null"`),
+  and an `enum` of several types is an `anyOf` of one typed `enum` for
+  each, at any depth; an empty `enum` is left out (Kimi and DeepSeek, an
+  MCP server's tools, #122);
+- `true` and `false` where a schema goes are `{}` and `{"not": {}}`
+  (`additionalProperties` is left); a `required` that isn't a list, and a
+  `type` JSON Schema doesn't name, are left out, and `"String"` is
+  `"string"`;
 - a tool's name with a character other than letters, digits, `_` and `-`
   (`.`, `:`, `/`, a space, CJK) is sent with `_` there, and the model's
   calls come back under the tool's own name.
+
+WorkBuddy AI's `gemini-3.8-flash` answers 400 "the conversation must end
+with a user message" (11153) to a chat whose tool results are followed by
+the user's message, as magpie sends Claude Code's reminders, words typed
+mid-task and a tool's images. Such a chat goes again with an empty
+assistant message between the results and the user's message, which it
+serves; a model that refused it once gets it that way from then on, until
+the plugin restarts. A chat ending with the assistant's message (a prefill)
+is refused as before.
 
 ## Models
 
@@ -110,6 +141,28 @@ is used.
 - MiniMax-M3
 
 A model's reasoning levels are its variants (`reasoningEffort`).
+
+A model's price is its `credits` ("x0.29") and the config's
+`modelPromotions`. A discount for whole days (Step-5-Preview's 独家限免) is
+the price now, with the price before it (`rateWas`). A price that holds only
+some hours of the day (Hy4 preview, free 23:00–8:00) is given as its full
+price, never as free: magpie keeps the list until it asks again, so a list
+asked for at night would say "free" all day (#121).
+
+## Credits in magpie
+
+magpie's usage card shows the account's credits from the resource summary.
+It also says when the soonest credits left run out (`runsOutAt`, and how
+many: `runsOut`), from the paid and free package lists WorkBuddy's own
+client reads. The daily Free Plan slice isn't counted: it ends at the same
+midnight on every account. magpie's smart routing spends the account whose
+credits run out first.
+
+An enterprise (team) account's resource summary lists no packages. Its
+credits are read from the enterprise meter
+(`/billing/meter/get-enterprise-user-usage`), the one WorkBuddy's own usage
+page reads: the cycle's credits used of its limit, and when the cycle
+resets (magpie #1904).
 
 ## Not here
 
