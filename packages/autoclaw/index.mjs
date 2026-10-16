@@ -144,7 +144,10 @@ async function callEnvelope(path, { method = "GET", body, base }) {
   let parsed;
   try { parsed = text ? JSON.parse(text) : undefined; } catch { parsed = undefined; }
   if (!parsed || (parsed.code === undefined && response.status >= 400)) {
-    throw new Error(`AutoClaw ${path.split("?")[0]} non-envelope response (HTTP ${response.status}): ${text.slice(0, 200)}`);
+    const err = new Error(`AutoClaw ${path.split("?")[0]} non-envelope response (HTTP ${response.status}): ${text.slice(0, 200)}`);
+    // 401/403 不论响应体形态都是登录失效：挂上标记，宿主才会提示重新登录
+    if (response.status === 401 || response.status === 403) err.signIn = "expired";
+    throw err;
   }
   return { status: response.status, code: parsed.code, msg: parsed.msg, data: parsed.data };
 }

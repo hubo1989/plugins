@@ -164,6 +164,22 @@ test("refreshTokens tries the oversea host first and marks a dead token expired"
   }
 })
 
+// A 401 whose body isn't an envelope (a gateway's plain text) must still tell
+// the host the sign-in is dead, or the user isn't offered to sign in again.
+test("refreshTokens marks a non-envelope 401 as expired too", async () => {
+  const realFetch = globalThis.fetch
+  globalThis.fetch = async () => new Response("Unauthorized", { status: 401 })
+  try {
+    let threw
+    try { await refreshTokens(jwt({ source_id: "google" }), []) } catch (e) { threw = e }
+    expect(threw).toBeInstanceOf(Error)
+    expect(threw.message).toContain("non-envelope response (HTTP 401)")
+    expect(threw.signIn).toBe("expired")
+  } finally {
+    globalThis.fetch = realFetch
+  }
+})
+
 // The local OAuth server against a fake upstream and a real listener: the
 // callback only accepts the state the authorize page handed out, and the
 // legacy /callback catch-all is gone.
